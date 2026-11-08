@@ -118,6 +118,12 @@ pub trait BlockEntity: Any + Send + Sync {
         None
     }
 
+    /// NBT for the block entity update packet sent when the block entity changes. Defaults to
+    /// [`BlockEntity::chunk_data_nbt`]; `None` sends no packet.
+    fn update_packet_nbt(&self) -> Option<NbtCompound> {
+        self.chunk_data_nbt()
+    }
+
     /// Obtain block actor NBT for fields Bedrock does not include in its block state.
     fn bedrock_block_actor_data(&self, _state_id: BlockStateId) -> Option<NbtCompound> {
         None

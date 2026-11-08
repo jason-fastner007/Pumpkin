@@ -412,7 +412,9 @@ impl EntityBase for ArmorStandEntity {
     }
 
     fn get_gravity(&self) -> f64 {
-        0.08
+        // Vanilla `ArmorStand.travel` does nothing for a marker, so it never falls, even when a
+        // block that ignores it (such as a piston-moved one) ends up around it.
+        if self.is_marker() { 0.0 } else { 0.08 }
     }
 
     fn cast_any(&self) -> &dyn std::any::Any {

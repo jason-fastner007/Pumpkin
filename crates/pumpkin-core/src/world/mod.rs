@@ -958,7 +958,13 @@ impl World {
             .synced_block_event_queue
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        queue.push(BlockEvent { pos, r#type, data });
+        // like vanilla's block event set: the same event twice in one tick runs once
+        if !queue
+            .iter()
+            .any(|e| e.pos == pos && e.r#type == r#type && e.data == data)
+        {
+            queue.push(BlockEvent { pos, r#type, data });
+        }
     }
 
     pub fn flush_synced_block_events(self: &Arc<Self>) {
@@ -1920,7 +1926,7 @@ impl World {
                     &pumpkin_protocol::bedrock::client::CUpdateBlock::new(block_pos, be_block_id),
                 );
                 if let Some(block_entity) = self.get_block_entity(&block_pos)
-                    && let Some(nbt) = block_entity.chunk_data_nbt()
+                    && let Some(nbt) = block_entity.update_packet_nbt()
                 {
                     let bytes = pumpkin_nbt::Nbt::from(nbt).write_unnamed();
                     self.broadcast_to_chunk(
@@ -1993,7 +1999,7 @@ impl World {
 
                 for (block_pos, _) in &updates {
                     if let Some(block_entity) = self.get_block_entity(block_pos)
-                        && let Some(nbt) = block_entity.chunk_data_nbt()
+                        && let Some(nbt) = block_entity.update_packet_nbt()
                     {
                         let bytes = pumpkin_nbt::Nbt::from(nbt).write_unnamed();
                         self.broadcast_to_chunk(
@@ -6725,7 +6731,7 @@ impl World {
         let block_entity_nbt = block_entity.chunk_data_nbt();
         let entity_id = block_entity.resource_location().to_string();
 
-        if let Some(nbt) = &block_entity_nbt {
+        if let Some(nbt) = &block_entity.update_packet_nbt() {
             let bytes = pumpkin_nbt::Nbt::from(nbt.clone()).write_unnamed();
             self.broadcast_to_chunk(
                 chunk_pos,
@@ -6843,9 +6849,7 @@ impl World {
     pub fn update_block_entity(&self, block_entity: &Arc<dyn BlockEntity>) {
         let block_pos = block_entity.get_position();
         let chunk_pos = block_pos.chunk_position();
-        let block_entity_nbt = block_entity.chunk_data_nbt();
-
-        if let Some(nbt) = &block_entity_nbt {
+        if let Some(nbt) = &block_entity.update_packet_nbt() {
             let bytes = pumpkin_nbt::Nbt::from(nbt.clone()).write_unnamed();
             self.broadcast_to_chunk(
                 chunk_pos,
@@ -6855,6 +6859,8 @@ impl World {
                     bytes.as_ref().into(),
                 ),
             );
+        }
+        if let Some(nbt) = &block_entity.chunk_data_nbt() {
             let mut full_nbt = nbt.clone();
             full_nbt.put_string("id", block_entity.resource_location().to_string());
             let pos = block_entity.get_position();

@@ -2,10 +2,11 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use crossbeam::atomic::AtomicCell;
-use pumpkin_data::{Block, BlockDirection, BlockState};
+use pumpkin_data::{Block, BlockDirection, BlockState, entity::EntityType};
 use pumpkin_nbt::compound::NbtCompound;
 use pumpkin_util::math::{boundingbox::BoundingBox, position::BlockPos, vector3::Vector3};
 
+use crate::entity::{EntityBase, decoration::armor_stand::ArmorStandEntity};
 use crate::world::{BlockFlags, World};
 
 use super::BlockEntity;
@@ -78,6 +79,10 @@ impl PistonBlockEntity {
         // Stretch by motion to get the swept volume (one tick of animation).
         let motion = Self::dir_vec(motion_dir, delta);
         let swept = block_aabb.stretch(motion);
+        // Vanilla `PistonMath.getMovementArea`: only the slab the moving face sweeps this tick.
+        // Entities are pushed only when they are in it, never when they sit on the trailing side,
+        // such as one standing on a block that retracts downwards.
+        let movement_area = Self::movement_area(block_aabb, motion_dir, delta);
         let slime = Block::from_state_id(self.pushed_block_state.id) == &Block::SLIME_BLOCK;
 
         for entity in world.get_entities_at_box(&swept) {
@@ -87,10 +92,18 @@ impl PistonBlockEntity {
             }
             // Player movement is client-authoritative; vanilla still nudges them
             // via Entity.move(PISTON), but we skip them here to avoid teleport jank.
-            // The same holds for the slime launch below: vanilla skips `ServerPlayer` there too,
-            // because the client runs this block entity itself from the block event and throws its
-            // own player. Launching players here as well would hit them a second time mid-flight.
-            if entity.get_player().is_some() {
+            // Vanilla also skips `ServerPlayer` for the slime launch: the client launches its own.
+            if entity.get_player().is_some() || Self::ignores_pistons(entity.as_ref()) {
+                continue;
+            }
+
+            // Only entities in front of the moving face are launched or pushed. Vanilla launches
+            // everything touching the block, but there the moving block still collides, so nothing
+            // sinks into it from behind. Pumpkin's moving piston has no collision yet: an entity
+            // resting on a slime block that retracts downwards sinks in for a tick, and launching
+            // it then threw it down through the floor.
+            let entity_aabb = e.bounding_box.load();
+            if !movement_area.intersects(&entity_aabb) {
                 continue;
             }
 
@@ -99,9 +112,7 @@ impl PistonBlockEntity {
             if slime {
                 Self::launch(e, motion_dir);
             }
-
-            let entity_aabb = e.bounding_box.load();
-            let intersection = Self::intersection_size(swept, motion_dir, entity_aabb);
+            let intersection = Self::intersection_size(movement_area, motion_dir, entity_aabb);
             if intersection <= 0.0 {
                 continue;
             }
@@ -119,6 +130,39 @@ impl PistonBlockEntity {
         }
     }
 
+    /// Vanilla `PistonMath.getMovementArea`: the part of `aabb`'s leading face swept by moving
+    /// `distance` towards `dir`.
+    fn movement_area(aabb: BoundingBox, dir: BlockDirection, distance: f64) -> BoundingBox {
+        let (min, max) = (aabb.min, aabb.max);
+        let (lo, hi) = match dir {
+            BlockDirection::Down => (
+                Vector3::new(min.x, min.y - distance, min.z),
+                Vector3::new(max.x, min.y, max.z),
+            ),
+            BlockDirection::Up => (
+                Vector3::new(min.x, max.y, min.z),
+                Vector3::new(max.x, max.y + distance, max.z),
+            ),
+            BlockDirection::North => (
+                Vector3::new(min.x, min.y, min.z - distance),
+                Vector3::new(max.x, max.y, min.z),
+            ),
+            BlockDirection::South => (
+                Vector3::new(min.x, min.y, max.z),
+                Vector3::new(max.x, max.y, max.z + distance),
+            ),
+            BlockDirection::West => (
+                Vector3::new(min.x - distance, min.y, min.z),
+                Vector3::new(min.x, max.y, max.z),
+            ),
+            BlockDirection::East => (
+                Vector3::new(max.x, min.y, min.z),
+                Vector3::new(max.x + distance, max.y, max.z),
+            ),
+        };
+        BoundingBox::new(lo, hi)
+    }
+
     /// Vanilla `getIntersectionSize`: how much `entity` overlaps `swept` along
     /// `motion_dir`. Positive means the entity is in the path of the moving block.
     fn intersection_size(
@@ -134,6 +178,29 @@ impl PistonBlockEntity {
             BlockDirection::South => swept.max.z - entity.min.z,
             BlockDirection::North => entity.max.z - swept.min.z,
         }
+    }
+
+    /// Entities whose vanilla `getPistonPushReaction` is `IGNORE`: pistons neither push nor
+    /// launch them.
+    fn ignores_pistons(entity: &dyn EntityBase) -> bool {
+        let entity_type = entity.get_entity().entity_type;
+        [
+            &EntityType::AREA_EFFECT_CLOUD,
+            &EntityType::MARKER,
+            &EntityType::BLOCK_DISPLAY,
+            &EntityType::ITEM_DISPLAY,
+            &EntityType::TEXT_DISPLAY,
+            &EntityType::INTERACTION,
+            &EntityType::PAINTING,
+            &EntityType::ITEM_FRAME,
+            &EntityType::GLOW_ITEM_FRAME,
+            &EntityType::LEASH_KNOT,
+        ]
+        .contains(&entity_type)
+            || entity
+                .cast_any()
+                .downcast_ref::<ArmorStandEntity>()
+                .is_some_and(ArmorStandEntity::is_marker)
     }
 
     /// Vanilla slime launch: the velocity component along `dir`'s axis becomes `dir`'s step.
@@ -232,6 +299,30 @@ const FACING: &str = "facing";
 const LAST_PROGRESS: &str = "progress";
 const EXTENDING: &str = "extending";
 const SOURCE: &str = "source";
+const BLOCK_STATE: &str = "blockState";
+
+/// A block state as vanilla writes it in NBT: `Name` plus `Properties` as strings.
+fn block_state_nbt(state: &BlockState) -> NbtCompound {
+    let block = Block::from_state_id(state.id);
+    let mut nbt = NbtCompound::new();
+    let name = if block.name.starts_with("minecraft:") {
+        block.name.to_string()
+    } else {
+        format!("minecraft:{}", block.name)
+    };
+    nbt.put_string("Name", name);
+    if let Some(props) = block.properties(state.id) {
+        let props = props.to_props();
+        if !props.is_empty() {
+            let mut props_nbt = NbtCompound::new();
+            for prop in props {
+                props_nbt.put_string(prop.key_str(), prop.value_str().to_string());
+            }
+            nbt.put_compound("Properties", props_nbt);
+        }
+    }
+    nbt
+}
 
 impl BlockEntity for PistonBlockEntity {
     fn resource_location(&self) -> &'static str {
@@ -302,12 +393,71 @@ impl BlockEntity for PistonBlockEntity {
         nbt.put_bool(SOURCE, self.source);
     }
 
-    // No `chunk_data_nbt`: vanilla never sends block entity data for a moving piston, the client
-    // builds its own from the block event. Sending ours (which lacked `blockState`) made the client
-    // reload its moving block entity as moving air: no collision, so a slime block never threw
-    // the player, who is only launched by the client's own copy.
+    fn chunk_data_nbt(&self) -> Option<NbtCompound> {
+        // What a client gets when it loads the chunk mid-animation, as in vanilla
+        // `PistonMovingBlockEntity.getUpdateTag`. Without `blockState` the client would animate
+        // air: no collision, so a slime block would not launch the player.
+        let mut nbt = NbtCompound::new();
+        nbt.put_compound(BLOCK_STATE, block_state_nbt(self.pushed_block_state));
+        nbt.put_int(FACING, i32::from(self.facing.to_index()));
+        nbt.put_float(LAST_PROGRESS, self.last_progress.load());
+        nbt.put_bool(EXTENDING, self.extending);
+        nbt.put_bool(SOURCE, self.source);
+        Some(nbt)
+    }
+
+    fn update_packet_nbt(&self) -> Option<NbtCompound> {
+        // Vanilla sends no update packet for a moving piston: the client animates it on its own
+        // from the block event, and launches its player off a slime block from that copy. An
+        // update would reload the client's copy mid-animation.
+        None
+    }
 
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use pumpkin_data::BlockDirection;
+    use pumpkin_util::math::{boundingbox::BoundingBox, position::BlockPos, vector3::Vector3};
+
+    use super::PistonBlockEntity;
+
+    fn block() -> BoundingBox {
+        BoundingBox::from_block(&BlockPos::new(0, 0, 0))
+    }
+
+    #[test]
+    fn movement_area_is_the_slab_in_front_of_the_moving_face() {
+        let cases = [
+            (BlockDirection::Up, [0.0, 1.0, 0.0], [1.0, 1.5, 1.0]),
+            (BlockDirection::Down, [0.0, -0.5, 0.0], [1.0, 0.0, 1.0]),
+            (BlockDirection::North, [0.0, 0.0, -0.5], [1.0, 1.0, 0.0]),
+            (BlockDirection::South, [0.0, 0.0, 1.0], [1.0, 1.0, 1.5]),
+            (BlockDirection::West, [-0.5, 0.0, 0.0], [0.0, 1.0, 1.0]),
+            (BlockDirection::East, [1.0, 0.0, 0.0], [1.5, 1.0, 1.0]),
+        ];
+        for (dir, min, max) in cases {
+            let area = PistonBlockEntity::movement_area(block(), dir, 0.5);
+            assert_eq!(area.min, Vector3::new(min[0], min[1], min[2]), "{dir:?}");
+            assert_eq!(area.max, Vector3::new(max[0], max[1], max[2]), "{dir:?}");
+        }
+    }
+
+    #[test]
+    fn entity_on_top_of_a_block_moving_down_is_not_pushed() {
+        // An armor-stand-sized entity resting on the block, slightly sunk in as after landing.
+        let on_top = BoundingBox::new(
+            Vector3::new(0.25, 0.99, 0.25),
+            Vector3::new(0.75, 2.97, 0.75),
+        );
+        let down = PistonBlockEntity::movement_area(block(), BlockDirection::Down, 0.5);
+        assert!(!down.intersects(&on_top));
+
+        // The same entity is in the way when the block moves up.
+        let up = PistonBlockEntity::movement_area(block(), BlockDirection::Up, 0.5);
+        assert!(up.intersects(&on_top));
     }
 }
