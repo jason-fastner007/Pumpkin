@@ -92,7 +92,8 @@ impl PistonBlockEntity {
             }
             // Player movement is client-authoritative; vanilla still nudges them
             // via Entity.move(PISTON), but we skip them here to avoid teleport jank.
-            // Vanilla also skips `ServerPlayer` for the slime launch: the client launches its own.
+            // The client launches its own player off a slime block from its copy of the moving
+            // block entity; a velocity set here would never reach it.
             if entity.get_player().is_some() || Self::ignores_pistons(entity.as_ref()) {
                 continue;
             }
@@ -109,7 +110,9 @@ impl PistonBlockEntity {
 
             // Vanilla `moveCollidedEntities`: a moving slime block sets the entity's velocity
             // along the motion axis to the motion direction (+-1), then pushes it like any block.
-            if slime {
+            // Like vanilla `canSimulateMovement`, an entity a player controls (a ridden horse,
+            // pig or boat) is launched by that player's client, not here.
+            if slime && entity.get_controlling_passenger().is_none() {
                 Self::launch(e, motion_dir);
             }
             let intersection = Self::intersection_size(movement_area, motion_dir, entity_aabb);
@@ -180,17 +183,24 @@ impl PistonBlockEntity {
         }
     }
 
-    /// Entities whose vanilla `getPistonPushReaction` is `IGNORE`: pistons neither push nor
-    /// launch them.
+    /// Entities pistons neither push nor launch.
+    ///
+    /// The first group is vanilla's `getPistonPushReaction() == IGNORE_ENTITY`. Paintings, item
+    /// frames and leash knots are `PUSH_PULL` in vanilla, but `BlockAttachedEntity.move` breaks
+    /// them and drops their item as soon as a piston moves them. Pumpkin does not break them yet,
+    /// so they are skipped rather than slid off their wall.
     fn ignores_pistons(entity: &dyn EntityBase) -> bool {
         let entity_type = entity.get_entity().entity_type;
         [
+            // IGNORE_ENTITY in vanilla
             &EntityType::AREA_EFFECT_CLOUD,
             &EntityType::MARKER,
             &EntityType::BLOCK_DISPLAY,
             &EntityType::ITEM_DISPLAY,
             &EntityType::TEXT_DISPLAY,
             &EntityType::INTERACTION,
+            &EntityType::OMINOUS_ITEM_SPAWNER,
+            // broken by pistons in vanilla, not implemented yet
             &EntityType::PAINTING,
             &EntityType::ITEM_FRAME,
             &EntityType::GLOW_ITEM_FRAME,
